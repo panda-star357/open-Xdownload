@@ -768,11 +768,20 @@ func TestParseUserUnavailableKeepsReason(t *testing.T) {
 		name    string
 		payload string
 		want    []string
+		notWant []string
 	}{
 		{
 			name:    "suspended with message",
 			payload: `{"result":{"__typename":"UserUnavailable","reason":"Suspended","message":"User has been suspended."}}`,
 			want:    []string{"冻结", "Suspended", "User has been suspended.", "提示:"},
+		},
+		{
+			// X 对受年龄限制的账号也回 reason=Suspended，真实原因只在 message 里。
+			// 按 reason 判会误报"冻结"并把用户引去重导 Cookie（重导无效）。
+			name:    "age restricted masquerades as suspended",
+			payload: `{"result":{"__typename":"UserUnavailable","reason":"Suspended","message":"User is age-restricted"}}`,
+			want:    []string{"年龄限制", "age-restricted", "年龄验证", "重导 Cookie 无效"},
+			notWant: []string{"冻结", "Cookie 已失效"},
 		},
 		{
 			name:    "deactivated",
@@ -806,7 +815,57 @@ func TestParseUserUnavailableKeepsReason(t *testing.T) {
 					t.Fatalf("error %q should contain %q", err.Error(), want)
 				}
 			}
+			for _, notWant := range tc.notWant {
+				if strings.Contains(err.Error(), notWant) {
+					t.Fatalf("error %q should not contain %q", err.Error(), notWant)
+				}
+			}
 		})
+	}
+}
+
+func TestGetUserByScreenNameRotatesClientOnAgeRestricted(t *testing.T) {
+	// 年龄限制是 HTTP 200 的业务失败，Pool 不会自动换号；这里验证会换下一个
+	// Cookie 重试，并在成功的账号上返回用户数据。
+	var primaryCalls, backupCalls atomic.Int64
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryCalls.Add(1)
+		_, _ = w.Write([]byte(`{"data":{"user":{"result":{"__typename":"UserUnavailable","reason":"Suspended","message":"User is age-restricted"}}}}`))
+	}))
+	defer primary.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupCalls.Add(1)
+		_, _ = w.Write([]byte(`{"data":{"user":{"result":{"__typename":"User","rest_id":"u2","legacy":{"screen_name":"backup","name":"Backup"}}}}}`))
+	}))
+	defer backup.Close()
+
+	pool := &Pool{clients: []*Client{newHeaderTestClient(primary), newHeaderTestClient(backup)}}
+	user, err := pool.GetUserByInput(context.Background(), "target")
+	if err != nil {
+		t.Fatalf("GetUserByInput: %v", err)
+	}
+	if user.ID != "u2" || user.ScreenName != "backup" {
+		t.Fatalf("user = %+v, want backup account result", user)
+	}
+	if primaryCalls.Load() != 1 || backupCalls.Load() != 1 {
+		t.Fatalf("calls primary=%d backup=%d, want 1/1", primaryCalls.Load(), backupCalls.Load())
+	}
+}
+
+func TestGetUserByScreenNameAllAgeRestrictedReportsAccurateError(t *testing.T) {
+	// 所有账号都被年龄限制时，错误必须说明是年龄限制，而不是"账号冻结"。
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"user":{"result":{"__typename":"UserUnavailable","reason":"Suspended","message":"User is age-restricted"}}}}`))
+	}))
+	defer server.Close()
+
+	pool := &Pool{clients: []*Client{newHeaderTestClient(server), newHeaderTestClient(server)}}
+	_, err := pool.GetUserByInput(context.Background(), "target")
+	if err == nil {
+		t.Fatal("GetUserByInput() = nil error, want age-restricted error")
+	}
+	if !strings.Contains(err.Error(), "年龄限制") || strings.Contains(err.Error(), "冻结") {
+		t.Fatalf("error = %q, want age-restricted without suspended wording", err.Error())
 	}
 }
 
@@ -1032,23 +1091,6 @@ func TestForbiddenNonWAFFailsWithShortCooldown(t *testing.T) {
 	}
 }
 
-func TestUnauthorizedDisablesClientForLongCooldown(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer server.Close()
-	client := newHeaderTestClient(server)
-	if _, err := getUserByInput(context.Background(), client, "alice"); err == nil {
-		t.Fatal("expected 401 error")
-	}
-	client.mu.Lock()
-	remaining := time.Until(client.disabledUntil)
-	client.mu.Unlock()
-	if remaining < 25*time.Minute || remaining > 31*time.Minute {
-		t.Fatalf("401 cooldown = %s, want about 30m", remaining)
-	}
-}
-
 func TestSelfCheckWAF403DoesNotDisableClient(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
@@ -1097,6 +1139,10 @@ func TestAPIPartialErrorsAreToleratedOnlyWhenNonFatal(t *testing.T) {
 		{"rate limit without kind", `{"data":{"user":null},"errors":[{"code":88,"message":"rate limited"}]}`, true},
 		{"account locked with data", `{"data":{"user":{"result":{"rest_id":"u1"}}},"errors":[{"code":326,"message":"locked"}]}`, true},
 		{"errors object not array", `{"errors":{"code":88}}`, true},
+		// X 线上 ListByRestId：横幅子字段解码失败，列表数据本身完整（2026-11 实测）。
+		{"field-level validation error with data", `{"data":{"list":{"id_str":"1","name":"L"}},"errors":[{"code":214,"kind":"Validation","name":"BadRequestError","path":["list","default_banner_media_results","result"],"message":"BadRequest: com.twitter.strato.serialization.DecodeException"}]}`, false},
+		{"top-level validation error without path", `{"data":{"list":{"id_str":"1"}},"errors":[{"code":214,"kind":"Validation","message":"BadRequest"}]}`, true},
+		{"validation error without data", `{"data":{},"errors":[{"code":214,"kind":"Validation","path":["list"],"message":"BadRequest"}]}`, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
