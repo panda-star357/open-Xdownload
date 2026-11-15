@@ -24,7 +24,7 @@ import (
 	"github.com/chenbin3625/open-Xdownload/internal/jobs"
 	"github.com/chenbin3625/open-Xdownload/internal/parser"
 	"github.com/chenbin3625/open-Xdownload/internal/storage"
-	"github.com/chenbin3625/open-Xdownload/internal/xclient"
+	"github.com/chenbin3625/open-Xdownload/internal/xapi"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -40,6 +40,8 @@ type Server struct {
 	loginAttempts []time.Time
 	// bcryptSem 限制并发 bcrypt 操作，避免 CPU DoS。
 	bcryptSem chan struct{}
+	// homeProber 是账号检测用的探测函数，由 cmd/server 注入；nil 表示未初始化。
+	homeProber xapi.HomeProber
 }
 
 const maxLoginAttempts = 10             // 窗口内最大尝试次数
@@ -52,6 +54,11 @@ func NewServer(store *storage.Store, parserService *parser.Service, manager *job
 		authChanged: make(chan struct{}),
 		bcryptSem:   make(chan struct{}, maxConcurrentBcrypt),
 	}
+}
+
+// SetHomeProber 注入账号检测用的探测函数（见 xapi.HomeProber）。须在开始处理请求前调用。
+func (s *Server) SetHomeProber(prober xapi.HomeProber) {
+	s.homeProber = prober
 }
 
 func (s *Server) publish(event jobs.Event) {
@@ -108,6 +115,15 @@ func (s *Server) Routes() http.Handler {
 	read("/api/local-directories", s.listLocalDirectories)
 	r.Post("/api/local-directories", s.createLocalDirectory)
 	r.Post("/api/auth/check", s.checkAuth)
+	// 账号池：Cookie 的唯一录入入口（/api/config 的旧 Cookie 字段已拒绝写入）。
+	read("/api/x-accounts", s.listXAccounts)
+	r.Post("/api/x-accounts", s.createXAccount)
+	r.Post("/api/x-accounts/import", s.importXAccounts)
+	r.Post("/api/x-accounts/check-all", s.checkAllXAccounts)
+	r.Patch("/api/x-accounts/{id}", s.updateXAccount)
+	r.Delete("/api/x-accounts/{id}", s.deleteXAccount)
+	r.Post("/api/x-accounts/{id}/check", s.checkXAccount)
+	r.Post("/api/x-accounts/{id}/unlock", s.unlockXAccount)
 	r.Post("/api/parse/tweet-link", s.parseTweetLink)
 	r.Post("/api/jobs", s.createJob)
 	r.Post("/api/jobs/batch", s.createJobsBatch)
@@ -126,6 +142,7 @@ func (s *Server) Routes() http.Handler {
 	read("/api/library/downloads", s.listDownloads)
 	read("/api/library/users", s.listLibraryUsers)
 	read("/api/archive/tweets", s.listTweets)
+	read("/api/archive/authors", s.listTweetAuthors)
 	read("/api/archive/tweets/{tweetID}", s.getTweet)
 	read("/api/archive/progress", s.tweetProgress)
 	r.Post("/api/archive/tweets/{tweetID}/retry-media", s.retryTweetMedia)
@@ -167,6 +184,10 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 	// 一次 null 请求就把 downloadDir/备用 Cookie/代理重置成默认值。这里明确拒绝。
 	fields, err := decodeJSONObject(w, r)
 	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := dropLegacyCookieFields(fields); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -227,6 +248,46 @@ func (s *Server) updateConfig(w http.ResponseWriter, r *http.Request) {
 	// 响应也要套一层 env 覆盖：GET 返回的是 env 生效值，若 PUT 响应回库内值，
 	// 前端"保存后比对"会永远不相等（这正是"env 覆盖部署下刷新配置被吞"的根因）。
 	writeJSON(w, http.StatusOK, config.ApplyEnvOverrides(updated).Redacted())
+}
+
+// legacyCookieConfigFields 是 /api/config 已移除的旧 Cookie 字段（JSON 名）。
+var legacyCookieConfigFields = []string{"authToken", "csrfToken", "additionalCookies"}
+
+// errLegacyCookieConfig 提示调用方 Cookie 已改到账号池管理。
+var errLegacyCookieConfig = storage.ErrValidation("Cookie 已改为在「设置 → X 账号池」中导入")
+
+// dropLegacyCookieFields 从配置 patch 里删掉旧 Cookie 字段，app_config 的旧列因此不会再经
+// /api/config 写入。空值和打码占位符（旧前端原样回传的读取结果）静默忽略；真实 Cookie
+// 返回 400，提示到账号池导入。
+func dropLegacyCookieFields(fields map[string]json.RawMessage) error {
+	for _, key := range legacyCookieConfigFields {
+		raw, ok := fields[key]
+		if !ok {
+			continue
+		}
+		delete(fields, key)
+		if !isLegacyCookiePlaceholder(raw) {
+			return errLegacyCookieConfig
+		}
+	}
+	return nil
+}
+
+// isLegacyCookiePlaceholder 报告提交值是否不含真实 Cookie：null、空串、SecretPlaceholder
+// 或 ClearSentinel。
+func isLegacyCookiePlaceholder(raw json.RawMessage) bool {
+	var value *string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return false
+	}
+	if value == nil {
+		return true
+	}
+	switch strings.TrimSpace(*value) {
+	case "", config.SecretPlaceholder, config.ClearSentinel:
+		return true
+	}
+	return false
 }
 
 // pathsEqual 比较两个目录是否指向同一位置，比较前统一 Abs + Clean，
@@ -337,94 +398,92 @@ func (s *Server) createLocalDirectory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, listing)
 }
 
+// checkAuth 是旧的"校验登录"兼容接口（契约见 docs/xscrape-design.md）：
+// configured 表示账号池里还有 active 账号；探测只打主账号（主账号不可用时取第一个
+// active 账号）一次，结果不写库——写库的检测走 POST /api/x-accounts/{id}/check。
 func (s *Server) checkAuth(w http.ResponseWriter, r *http.Request) {
-	cfg, err := s.store.GetConfig(r.Context())
+	// 旧前端会把整份配置 POST 过来。Cookie 已迁到账号池，请求体只做形状校验：
+	// 真实 Cookie 值按 /api/config 的规则拒绝，空值/打码占位符静默忽略。
+	hasBody := r.ContentLength > 0 || (r.ContentLength < 0 && r.Header.Get("Content-Type") != "")
+	if hasBody {
+		fields, err := decodeJSONObject(w, r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := dropLegacyCookieFields(fields); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	accounts, err := s.store.ListXAccounts(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	// 有 body 时用提交的配置做探测；无 body 时用已存配置。
-	// ContentLength == -1 表示 chunked（也可能有 body），改用 Content-Type 判断。
-	hasBody := r.ContentLength > 0 || (r.ContentLength < 0 && r.Header.Get("Content-Type") != "")
-	if hasBody {
-		var submitted config.AppConfig
-		if err := decodeJSON(w, r, &submitted); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		stored, err := s.store.GetStoredConfig(r.Context())
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		resolved, err := config.ResolveSubmission(submitted, stored)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, storage.ErrValidation(err.Error()))
-			return
-		}
-		cfg = config.ApplyEnvOverrides(resolved)
-	}
-	configured := cfg.AuthToken != "" && cfg.CSRFToken != ""
+	target, configured := xAccountCheckTarget(accounts)
 	if !configured {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"configured": false,
 			"ok":         false,
-			"message":    "请先配置 auth_token 和 ct0",
+			"message":    "请先在「设置 → X 账号池」导入至少一个可用账号",
 		})
 		return
 	}
-	// 用临时池做"非破坏性探测"，不复用 jobs 的生产池：
-	// CheckAll/GetSelfScreenName 在 401（及非 WAF 的 403）时会调用 disable（主账号
-	// 30 分钟、备用 5 分钟）。如果探测打到正在归档的生产池上，用户点一次"检测 Cookie"
-	// 就可能让归档任务半小时内用不了主账号。临时池与生产池共享底层
-	// httpx.Transport（按代理缓存），连接仍复用，探测本身只在手动点击时发生。
-	probePool, err := xclient.NewPool(cfg)
-	if err != nil {
+	if s.homeProber == nil {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"configured": configured,
 			"ok":         false,
-			"message":    err.Error(),
+			"message":    "账号检测功能还没有初始化",
 		})
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-	defer cancel()
-	diagnostics := probePool.CheckAll(ctx)
-	// "校验通过"必须以真正拿到 screen name 为准：Diagnostics().Available 只表示
-	// "客户端没有被 disable"，网络不通/代理错误时它仍然是 1，会被误报成通过。
-	screenName := ""
-	for _, client := range diagnostics.Clients {
-		if client.OK && client.ScreenName != "" {
-			screenName = client.ScreenName
-			if client.Primary {
-				break
-			}
-		}
+	globalProxy, err := s.effectiveProxyURL(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
-	if screenName == "" {
-		message := "X 登录校验失败：未能通过认证（Cookie 可能已失效）"
-		if diagnostics.Available == 0 {
-			message = "所有 X Cookie 均不可用"
-		}
+	check := s.probeXAccount(r.Context(), target, globalProxy)
+	if r.Context().Err() != nil {
+		return
+	}
+	if check.Err != "" {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"configured":  configured,
-			"ok":          false,
-			"message":     message,
-			"diagnostics": diagnostics,
+			"configured": configured,
+			"ok":         false,
+			"message":    "X 登录校验失败：" + check.Err,
 		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"configured": configured,
-		"ok":         true,
-		"screenName": screenName,
+		"ok":         check.ScreenName != "",
+		"screenName": check.ScreenName,
 		"message":    "X 登录校验通过",
-		// 检测只走 GET /home 并解析 screen name，证明的是"Cookie 能登录"，不代表
-		// 该账号能访问受保护或受年龄限制的内容。明确写出来，避免用户把检测通过
-		// 当成"所有归档都能成功"。
-		"note":        "仅验证登录状态，不代表可访问受保护或受年龄限制的内容",
-		"diagnostics": diagnostics,
+		// 检测只证明"Cookie 能登录"，不代表该账号能访问受保护或受年龄限制的内容。
+		// 明确写出来，避免用户把检测通过当成"所有归档都能成功"。
+		"note": "仅验证登录状态，不代表可访问受保护或受年龄限制的内容",
 	})
+}
+
+// xAccountCheckTarget 选兼容接口要探测的账号：active 主账号优先，否则第一个 active
+// 账号。没有 active 账号时第二个返回值为 false。
+func xAccountCheckTarget(accounts []storage.XAccount) (storage.XAccount, bool) {
+	var fallback storage.XAccount
+	found := false
+	for _, account := range accounts {
+		if !account.Active {
+			continue
+		}
+		if account.IsPrimary {
+			return account, true
+		}
+		if !found {
+			fallback = account
+			found = true
+		}
+	}
+	return fallback, found
 }
 
 func (s *Server) parseTweetLink(w http.ResponseWriter, r *http.Request) {
@@ -461,7 +520,7 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	job, err := s.store.CreateArchiveJob(r.Context(), storage.JobDraft{Kind: kind, Input: input, Title: title, ArchiveMode: req.ArchiveMode, Backfill: req.Backfill})
+	job, err := s.store.CreateArchiveJob(r.Context(), storage.JobDraft{Kind: kind, Input: input, Title: title, ArchiveMode: req.ArchiveMode, Backfill: req.Backfill, BatchSize: req.BatchSize})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -499,7 +558,7 @@ func (s *Server) createJobsBatch(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		seen[key] = struct{}{}
-		prepared = append(prepared, storage.JobDraft{Kind: kind, Input: input, Title: title, ArchiveMode: item.ArchiveMode, Backfill: item.Backfill})
+		prepared = append(prepared, storage.JobDraft{Kind: kind, Input: input, Title: title, ArchiveMode: item.ArchiveMode, Backfill: item.Backfill, BatchSize: item.BatchSize})
 	}
 	if len(prepared) == 0 {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("没有可创建的任务"))
@@ -620,6 +679,7 @@ type jobRequest struct {
 	Title       string              `json:"title"`
 	ArchiveMode storage.ArchiveMode `json:"archiveMode"`
 	Backfill    bool                `json:"backfill"`
+	BatchSize   int                 `json:"batchSize"`
 }
 
 type batchJobRequest struct {
@@ -683,6 +743,9 @@ func (s *Server) prepareJob(ctx context.Context, req jobRequest) (storage.JobKin
 	if !req.ArchiveMode.Valid() {
 		return "", "", "", storage.ErrValidation("无效的归档模式")
 	}
+	if req.BatchSize < 0 || req.BatchSize > storage.MaxArchiveBatchSize {
+		return "", "", "", storage.ErrValidation(fmt.Sprintf("每轮用户数必须在 0 到 %d 之间", storage.MaxArchiveBatchSize))
+	}
 	if req.Kind == "" {
 		req.Kind = storage.JobKindTweetLink
 	}
@@ -733,27 +796,58 @@ func parserOptionsFromConfig(cfg config.AppConfig) parser.ParseOptions {
 }
 
 type jobListPage struct {
-	Items    []storage.Job `json:"items"`
-	Page     int           `json:"page"`
-	PageSize int           `json:"pageSize"`
+	Items    []storage.Job         `json:"items"`
+	Page     int                   `json:"page"`
+	PageSize int                   `json:"pageSize"`
+	Total    int                   `json:"total"`
+	Counts   storage.JobListCounts `json:"counts"`
 }
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	page := parsePositiveInt(r, "page", 1, 1, 1000000)
 	pageSize := parsePositiveInt(r, "pageSize", 10, 1, 100)
-	offset := (page - 1) * pageSize
-	items, err := s.store.ListJobsPage(r.Context(), pageSize, offset)
+	status := r.URL.Query().Get("status")
+	if status != "" && status != "all" && status != "active" && status != "completed" && status != "failed" {
+		writeError(w, http.StatusBadRequest, storage.ErrValidation("无效的任务状态筛选"))
+		return
+	}
+	kindValue := strings.TrimSpace(r.URL.Query().Get("kind"))
+	if kindValue == "all" {
+		kindValue = ""
+	}
+	if kindValue != "" {
+		switch storage.JobKind(kindValue) {
+		case storage.JobKindTweetLink, storage.JobKindMediaURL, storage.JobKindUser, storage.JobKindList, storage.JobKindFollowing, storage.JobKindFailedRetry, storage.JobKindAssetMigration:
+		default:
+			writeError(w, http.StatusBadRequest, storage.ErrValidation("无效的任务类型筛选"))
+			return
+		}
+	}
+	keyword := strings.TrimSpace(r.URL.Query().Get("q"))
+	if keyword == "" {
+		keyword = strings.TrimSpace(r.URL.Query().Get("search"))
+	}
+	if characters := []rune(keyword); len(characters) > 120 {
+		keyword = string(characters[:120])
+	}
+	result, err := s.store.ListJobsPageFiltered(r.Context(), pageSize, page, storage.JobListFilter{
+		Status:  status,
+		Kind:    storage.JobKind(kindValue),
+		Keyword: keyword,
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if items == nil {
-		items = []storage.Job{}
+	if result.Items == nil {
+		result.Items = []storage.Job{}
 	}
 	writeJSON(w, http.StatusOK, jobListPage{
-		Items:    items,
-		Page:     page,
-		PageSize: pageSize,
+		Items:    result.Items,
+		Page:     result.Page,
+		PageSize: result.PageSize,
+		Total:    result.Total,
+		Counts:   result.Counts,
 	})
 }
 

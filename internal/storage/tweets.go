@@ -52,6 +52,17 @@ type TweetPage struct {
 	Items      []ArchivedTweet `json:"items"`
 	Pagination Pagination      `json:"pagination"`
 }
+type TweetAuthor struct {
+	Value string `json:"value"`
+	Label string `json:"label"`
+}
+
+func (s *Store) ListTweetAuthors(ctx context.Context) ([]TweetAuthor, error) {
+	authors := []TweetAuthor{}
+	err := s.db.SelectContext(ctx, &authors, `SELECT screen_name AS value, MAX(author_name) AS label FROM tweets GROUP BY author_id, screen_name ORDER BY lower(screen_name)`)
+	return authors, err
+}
+
 type TweetSync struct {
 	UserID    string    `json:"userId" db:"user_id"`
 	LastID    string    `json:"lastId" db:"last_id"`
@@ -69,7 +80,7 @@ func (s *Store) migrateArchive() error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, col := range []struct{ name, definition string }{{"archive_mode", "TEXT NOT NULL DEFAULT 'media'"}, {"backfill", "BOOLEAN NOT NULL DEFAULT 0"}} {
+	for _, col := range []struct{ name, definition string }{{"archive_mode", "TEXT NOT NULL DEFAULT 'media'"}, {"backfill", "BOOLEAN NOT NULL DEFAULT 0"}, {"batch_size", "INTEGER NOT NULL DEFAULT 0"}} {
 		var count int
 		if err := tx.Get(&count, `SELECT COUNT(*) FROM pragma_table_info('jobs') WHERE name=?`, col.name); err != nil {
 			return err
@@ -343,18 +354,64 @@ func (s *Store) GetTweet(ctx context.Context, id string) (ArchivedTweet, error) 
 	return s.getTweet(ctx, id, 0)
 }
 
+// normalizeTweetData 保证数组字段在 JSON 中始终是 []，而不是 null。
+// 早期归档或外部导入的数据可能缺少这些字段。
+func normalizeTweetData(tweet *parser.TweetData) {
+	if tweet.Media == nil {
+		tweet.Media = []parser.Media{}
+	}
+	for index := range tweet.Media {
+		if tweet.Media[index].Variants == nil {
+			tweet.Media[index].Variants = []parser.MediaVariant{}
+		}
+	}
+	for index := range tweet.Related {
+		normalizeTweetData(&tweet.Related[index])
+	}
+}
+
 func (s *Store) getTweet(ctx context.Context, id string, jobID int64) (ArchivedTweet, error) {
 	var row struct {
-		Payload    string    `db:"payload"`
-		ArchivedAt time.Time `db:"archived_at"`
+		ID          string    `db:"id"`
+		AuthorID    string    `db:"author_id"`
+		ScreenName  string    `db:"screen_name"`
+		AuthorName  string    `db:"author_name"`
+		Body        string    `db:"body"`
+		PublishedAt time.Time `db:"published_at"`
+		Payload     string    `db:"payload"`
+		ArchivedAt  time.Time `db:"archived_at"`
 	}
-	if err := s.db.GetContext(ctx, &row, `SELECT payload,archived_at FROM tweets WHERE id=?`, id); err != nil {
+	if err := s.db.GetContext(ctx, &row, `SELECT id,author_id,screen_name,author_name,body,published_at,payload,archived_at FROM tweets WHERE id=?`, id); err != nil {
 		return ArchivedTweet{}, err
 	}
 	result := ArchivedTweet{ArchivedAt: row.ArchivedAt, JobIDs: []int64{}, Downloads: []DownloadRecord{}}
 	if err := json.Unmarshal([]byte(row.Payload), &result.TweetData); err != nil {
 		return result, err
 	}
+	// 旧版本/外部导入的 payload 可能不完整。列里存的是归档时同一份基础字段，
+	// 用它们补全空值，避免列表显示空记录。
+	if result.ID == "" {
+		result.ID = row.ID
+	}
+	if result.Author.ID == "" {
+		result.Author.ID = row.AuthorID
+	}
+	if result.Author.ScreenName == "" {
+		result.Author.ScreenName = row.ScreenName
+	}
+	if result.Author.Name == "" {
+		result.Author.Name = row.AuthorName
+	}
+	if result.Text == "" {
+		result.Text = row.Body
+	}
+	if result.CreatedAt.IsZero() {
+		result.CreatedAt = row.PublishedAt
+	}
+	// 旧版本/不完整的 payload 可能没有 media 字段，反序列化后是 nil，
+	// 序列化出去会变成 "media": null。API 契约是数组，这里统一归一化，
+	// 避免前端对 null 调 .length 导致整页崩溃。
+	normalizeTweetData(&result.TweetData)
 	if err := s.db.SelectContext(ctx, &result.JobIDs, `SELECT job_id FROM tweet_jobs WHERE tweet_id=? ORDER BY job_id DESC`, id); err != nil {
 		return result, err
 	}
@@ -464,6 +521,33 @@ func (s *Store) GetTweetSync(ctx context.Context, userID string) (TweetSync, err
 	var state TweetSync
 	err := s.db.GetContext(ctx, &state, `SELECT * FROM tweet_sync WHERE user_id=?`, userID)
 	return state, err
+}
+
+// TouchTweetSync 只推进 updated_at，不清空全文归档的进度字段。用于让没有产生
+// tweet_sync 的受保护用户也能按“最久未处理”轮转到队尾。
+func (s *Store) TouchTweetSync(ctx context.Context, userID string) error {
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO tweet_sync(user_id, updated_at) VALUES(?, ?)
+ON CONFLICT(user_id) DO UPDATE SET updated_at=excluded.updated_at`,
+		userID, time.Now().UTC())
+	return err
+}
+
+// ListTweetSyncUpdatedAt 返回每个用户最近一次全文归档时间。只读，不像
+// GetTweetSync 那样为不存在的用户插入空行。
+func (s *Store) ListTweetSyncUpdatedAt(ctx context.Context) (map[string]time.Time, error) {
+	rows := []struct {
+		UserID    string    `db:"user_id"`
+		UpdatedAt time.Time `db:"updated_at"`
+	}{}
+	if err := s.db.SelectContext(ctx, &rows, `SELECT user_id, updated_at FROM tweet_sync`); err != nil {
+		return nil, err
+	}
+	result := make(map[string]time.Time, len(rows))
+	for _, row := range rows {
+		result[row.UserID] = row.UpdatedAt
+	}
+	return result, nil
 }
 
 func (s *Store) SaveTweetSync(ctx context.Context, state TweetSync) error {

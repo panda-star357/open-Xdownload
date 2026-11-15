@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -113,8 +114,10 @@ const sqliteOpenOptions = "?_txlock=immediate&_texttotime=1&_pragma=busy_timeout
 // job_checkpoints 表（长任务分段执行的检查点）。
 // v9: jobs.deferred_seconds（限流累计推迟上限）、user_entities.last_full_scan_at
 // （定时任务每 7 天的全量扫描基线）、media_sync 表（媒体时间线逐页游标）。
-// v10: users.avatar_url（归档库按用户浏览时显示头像）。
-const schemaVersion = 10
+// v10: x_accounts / x_account_locks / x_account_stats（twscrape 风格账号池）。
+// v11: jobs.batch_size（定时全文归档每轮最多用户数）。
+// v12: users.avatar_url（归档库按用户浏览时显示头像）。
+const schemaVersion = 12
 
 // ErrSchemaTooNew 表示库由更新版本写入，当前二进制不认识。
 var ErrSchemaTooNew = errors.New("数据库结构版本高于当前程序")
@@ -123,6 +126,7 @@ const (
 	MinArchiveScheduleIntervalMinutes = 5
 	MaxArchiveScheduleIntervalMinutes = 60 * 24 * 30
 	MaxArchiveScheduleItems           = 200
+	MaxArchiveBatchSize               = 1000
 )
 
 var ErrArchiveScheduleAlreadyClaimed = errors.New("定时归档计划已被其他运行领取")
@@ -524,6 +528,13 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 		return err
 	}
 	if err := s.migrateAssets(); err != nil {
+		return err
+	}
+	if err := s.migrateXAccounts(); err != nil {
+		return err
+	}
+	// 旧 app_config Cookie 列一次性导入账号池；旧列保留到下一个版本再删。
+	if err := s.runMigrationOnce("migrate_cookies_to_x_accounts", s.migrateCookiesToXAccounts); err != nil {
 		return err
 	}
 	return s.setSchemaVersion()
@@ -1617,6 +1628,74 @@ LIMIT ? OFFSET ?`, limit, offset)
 	return jobs, err
 }
 
+// ListJobsPageFiltered 返回服务端筛选后的任务页，以及同一类型/关键词条件下的全量状态计数。
+// 状态计数不受 filter.Status 影响，便于前端在状态标签上展示可用总数。
+func (s *Store) ListJobsPageFiltered(ctx context.Context, limit int, page int, filter JobListFilter) (JobListPage, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 20
+	}
+	if page < 1 {
+		page = 1
+	}
+
+	baseWhere, baseArgs := jobListWhere(filter, false)
+	countWhere, countArgs := jobListWhere(filter, true)
+	result := JobListPage{Items: []Job{}, Page: page, PageSize: limit, Counts: JobListCounts{}}
+	countSQL := fmt.Sprintf(`SELECT COUNT(*),
+	COALESCE(SUM(CASE WHEN status IN (%s) THEN 1 ELSE 0 END), 0),
+	COALESCE(SUM(CASE WHEN status = '%s' AND COALESCE(error, '') = '' THEN 1 ELSE 0 END), 0),
+	COALESCE(SUM(CASE WHEN status IN (%s) OR COALESCE(error, '') <> '' THEN 1 ELSE 0 END), 0)
+	FROM jobs WHERE `+countWhere, activeJobStatusesSQL, JobCompleted, failedJobStatusesSQL)
+	if err := s.db.QueryRowContext(ctx, countSQL, countArgs...).Scan(&result.Counts.All, &result.Counts.Active, &result.Counts.Completed, &result.Counts.Failed); err != nil {
+		return JobListPage{}, err
+	}
+	switch filter.Status {
+	case "active":
+		result.Total = result.Counts.Active
+	case "completed":
+		result.Total = result.Counts.Completed
+	case "failed":
+		result.Total = result.Counts.Failed
+	default:
+		result.Total = result.Counts.All
+	}
+
+	offset := (page - 1) * limit
+	if err := s.db.SelectContext(ctx, &result.Items, `
+SELECT * FROM jobs
+WHERE `+baseWhere+`
+ORDER BY created_at DESC, id DESC
+LIMIT ? OFFSET ?`, append(baseArgs, limit, offset)...); err != nil {
+		return JobListPage{}, err
+	}
+	return result, nil
+}
+
+func jobListWhere(filter JobListFilter, ignoreStatus bool) (string, []any) {
+	where := []string{"1=1"}
+	args := []any{}
+	if !ignoreStatus {
+		switch filter.Status {
+		case "active":
+			where = append(where, "status IN ("+activeJobStatusesSQL+")")
+		case "completed":
+			where = append(where, "status = ? AND COALESCE(error, '') = ''")
+			args = append(args, string(JobCompleted))
+		case "failed":
+			where = append(where, "(status IN ("+failedJobStatusesSQL+") OR COALESCE(error, '') <> '')")
+		}
+	}
+	if filter.Kind != "" {
+		where = append(where, "kind = ?")
+		args = append(args, string(filter.Kind))
+	}
+	if keyword := strings.TrimSpace(filter.Keyword); keyword != "" {
+		where = append(where, "(instr(lower(title), lower(?)) > 0 OR instr(lower(input), lower(?)) > 0 OR instr(lower(message), lower(?)) > 0 OR instr(lower(error), lower(?)) > 0 OR instr(CAST(id AS TEXT), ?) > 0)")
+		args = append(args, keyword, keyword, keyword, keyword, keyword)
+	}
+	return strings.Join(where, " AND "), args
+}
+
 func (s *Store) JobStats(ctx context.Context) (JobStats, error) {
 	stats, _, err := s.DashboardMeta(ctx)
 	return stats, err
@@ -1825,10 +1904,10 @@ VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
 RETURNING *`, job.Kind, JobPending, job.Input, job.Title, "排队中", now, now, now, now.UnixNano(), JobSourceManual); err != nil {
 		return Job{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET archive_mode=?, backfill=? WHERE id=?`, job.ArchiveMode, job.Backfill, retried.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET archive_mode=?, backfill=?, batch_size=? WHERE id=?`, job.ArchiveMode, job.Backfill, job.BatchSize, retried.ID); err != nil {
 		return Job{}, err
 	}
-	retried.ArchiveMode, retried.Backfill = job.ArchiveMode, job.Backfill
+	retried.ArchiveMode, retried.Backfill, retried.BatchSize = job.ArchiveMode, job.Backfill, job.BatchSize
 	if err := tx.Commit(); err != nil {
 		return Job{}, err
 	}
@@ -2004,9 +2083,9 @@ SELECT kind, input FROM jobs WHERE status IN (`+activeJobStatusesSQL+`)`); err !
 
 	var query strings.Builder
 	query.WriteString(`
-INSERT INTO jobs (kind, status, input, title, progress, message, created_at, updated_at, enqueued_at, enqueue_ns, source, archive_mode, backfill)
+INSERT INTO jobs (kind, status, input, title, progress, message, created_at, updated_at, enqueued_at, enqueue_ns, source, archive_mode, backfill, batch_size)
 VALUES `)
-	args := make([]any, 0, len(drafts)*10)
+	args := make([]any, 0, len(drafts)*11)
 	for index, draft := range drafts {
 		if index > 0 {
 			query.WriteString(",")
@@ -2014,8 +2093,11 @@ VALUES `)
 		if !draft.ArchiveMode.Valid() {
 			return nil, ErrValidation("无效的归档模式")
 		}
-		query.WriteString("(?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)")
-		args = append(args, draft.Kind, JobPending, draft.Input, draft.Title, message, now, now, now, now.UnixNano(), draft.Source.Normalized(), draft.ArchiveMode.Normalized(), draft.Backfill)
+		if draft.BatchSize < 0 || draft.BatchSize > MaxArchiveBatchSize {
+			return nil, ErrValidation(fmt.Sprintf("每轮用户数必须在 0 到 %d 之间", MaxArchiveBatchSize))
+		}
+		query.WriteString("(?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+		args = append(args, draft.Kind, JobPending, draft.Input, draft.Title, message, now, now, now, now.UnixNano(), draft.Source.Normalized(), draft.ArchiveMode.Normalized(), draft.Backfill, draft.BatchSize)
 	}
 	query.WriteString(" RETURNING *")
 
@@ -2107,7 +2189,10 @@ func (s *Store) GetArchiveSchedule(ctx context.Context, id int64) (ArchiveSchedu
 	if err != nil {
 		return ArchiveSchedule{}, err
 	}
-	return hydrateArchiveSchedule(schedule)
+	if schedule, err = hydrateArchiveSchedule(schedule); err != nil {
+		return ArchiveSchedule{}, err
+	}
+	return s.enrichArchiveScheduleRunStatus(ctx, schedule)
 }
 
 func (s *Store) ListArchiveSchedules(ctx context.Context) ([]ArchiveSchedule, error) {
@@ -2117,7 +2202,11 @@ SELECT * FROM archive_schedules
 ORDER BY enabled DESC, next_run_at ASC, updated_at DESC`); err != nil {
 		return nil, err
 	}
-	return hydrateArchiveSchedules(items)
+	items, err := hydrateArchiveSchedules(items)
+	if err != nil {
+		return nil, err
+	}
+	return s.enrichArchiveScheduleRunStatuses(ctx, items)
 }
 
 func (s *Store) ListDueArchiveSchedules(ctx context.Context, now time.Time, limit int) ([]ArchiveSchedule, error) {
@@ -2133,6 +2222,80 @@ LIMIT ?`, now.UTC(), limit); err != nil {
 		return nil, err
 	}
 	return hydrateArchiveSchedules(items)
+}
+
+func (s *Store) enrichArchiveScheduleRunStatuses(ctx context.Context, schedules []ArchiveSchedule) ([]ArchiveSchedule, error) {
+	for i := range schedules {
+		item, err := s.enrichArchiveScheduleRunStatus(ctx, schedules[i])
+		if err != nil {
+			return nil, err
+		}
+		schedules[i] = item
+	}
+	return schedules, nil
+}
+
+func (s *Store) enrichArchiveScheduleRunStatus(ctx context.Context, schedule ArchiveSchedule) (ArchiveSchedule, error) {
+	if len(schedule.LastJobIDs) == 0 {
+		return schedule, nil
+	}
+	type jobResult struct {
+		Status  JobStatus `db:"status"`
+		Message string    `db:"message"`
+		Error   string    `db:"error"`
+	}
+	query, args, err := sqlx.In(`SELECT status, message, error FROM jobs WHERE id IN (?)`, schedule.LastJobIDs)
+	if err != nil {
+		return schedule, err
+	}
+	var results []jobResult
+	if err := s.db.SelectContext(ctx, &results, s.db.Rebind(query), args...); err != nil {
+		return schedule, err
+	}
+	if len(results) == 0 {
+		return schedule, nil
+	}
+	hasActive := false
+	hasFailed := false
+	hasCanceled := false
+	message := ""
+	failureMessage := ""
+	for _, result := range results {
+		if IsActiveJobStatus(result.Status) {
+			hasActive = true
+		}
+		if slices.Contains(FailedJobStatuses, result.Status) || strings.TrimSpace(result.Error) != "" {
+			hasFailed = true
+			if failureMessage == "" {
+				failureMessage = strings.TrimSpace(result.Error)
+				if failureMessage == "" {
+					failureMessage = strings.TrimSpace(result.Message)
+				}
+			}
+		}
+		if result.Status == JobCanceled {
+			hasCanceled = true
+		}
+		if message == "" {
+			message = strings.TrimSpace(result.Error)
+			if message == "" {
+				message = strings.TrimSpace(result.Message)
+			}
+		}
+	}
+	switch {
+	case hasActive:
+		schedule.LastRunStatus = "running"
+	case hasFailed:
+		schedule.LastRunStatus = "failed"
+		message = failureMessage
+	case hasCanceled:
+		schedule.LastRunStatus = "canceled"
+	default:
+		schedule.LastRunStatus = "success"
+	}
+	schedule.LastRunMessage = message
+	return schedule, nil
 }
 
 func (s *Store) DeleteArchiveSchedule(ctx context.Context, id int64) error {
@@ -2241,7 +2404,7 @@ WHERE id = ?`,
 	}
 	drafts := make([]JobDraft, 0, len(schedule.Items))
 	for _, item := range schedule.Items {
-		drafts = append(drafts, JobDraft{Kind: item.Kind, Input: item.Input, Title: item.Title, ArchiveMode: item.ArchiveMode, Backfill: item.Backfill, Source: source})
+		drafts = append(drafts, JobDraft{Kind: item.Kind, Input: item.Input, Title: item.Title, ArchiveMode: item.ArchiveMode, Backfill: item.Backfill, BatchSize: item.BatchSize, Source: source})
 	}
 	jobs, err := s.insertJobs(ctx, tx, drafts, "定时归档排队中", runAt, true)
 	if err != nil {
@@ -3665,6 +3828,9 @@ func prepareArchiveScheduleForSave(schedule ArchiveSchedule) (ArchiveSchedule, e
 	for _, item := range schedule.Items {
 		if !item.ArchiveMode.Valid() {
 			return ArchiveSchedule{}, ErrValidation("无效的归档模式")
+		}
+		if item.BatchSize < 0 || item.BatchSize > MaxArchiveBatchSize {
+			return ArchiveSchedule{}, ErrValidation(fmt.Sprintf("每轮用户数必须在 0 到 %d 之间", MaxArchiveBatchSize))
 		}
 		item.Input = strings.TrimSpace(item.Input)
 		item.Title = strings.TrimSpace(item.Title)

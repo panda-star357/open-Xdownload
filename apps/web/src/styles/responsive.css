@@ -4,17 +4,13 @@
    同断点的规则集中在这里，就近的组件文件只写默认态。
    ========================================================= */
 
-/* ---------------- ≥1280px：设置页双栏 ---------------- */
+/* ---------------- ≥1280px：导入格式说明双栏 ---------------- */
 
 @media (min-width: 1280px) {
-  .settings-secondary-grid {
-    grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.2fr);
-    gap: 32px;
-  }
-
-  .settings-secondary-grid > section:first-child {
-    padding-right: 32px;
-    border-right: 1px solid var(--line);
+  .x-account-import-formats {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px 16px;
   }
 }
 
@@ -23,10 +19,6 @@
 @media (max-width: 1099.98px) {
   .storage-settings {
     grid-template-columns: minmax(0, 1fr);
-  }
-
-  .storage-media-heading {
-    display: none;
   }
 
   .storage-media-row {
@@ -45,10 +37,6 @@
   .storage-media-field > div:first-child {
     display: flex;
   }
-
-  .storage-rule-fields {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
 }
 
 /* ---------------- ≤767.98px：平板与手机共用 ---------------- */
@@ -58,10 +46,6 @@
   .task-details {
     gap: 14px;
     padding: 14px;
-    border: 0;
-    border-radius: 0;
-    box-shadow: none;
-    background: var(--surface-muted);
   }
 
   .task-details-meta {
@@ -81,8 +65,6 @@
       minmax(0, 0.8fr) minmax(0, 1.2fr) minmax(0, 1fr)
       minmax(0, 0.85fr);
     gap: 4px;
-    padding: 0;
-    background: transparent;
     white-space: normal;
   }
 
@@ -99,22 +81,13 @@
 
   .task-center .toolbar-status .semi-radio-addon-buttonRadio {
     display: flex;
-    min-height: 36px;
     align-items: center;
     justify-content: center;
     padding: 6px 4px;
-    border-radius: var(--radius-control);
-    background: var(--surface);
-    font-size: 12px;
   }
 
   .task-center .toolbar-status .semi-radio-addon-buttonRadio > span {
     gap: 4px;
-  }
-
-  .task-center .toolbar-status .semi-radio-checked .semi-radio-addon-buttonRadio {
-    background: var(--accent-soft);
-    color: var(--accent-active);
   }
 
   /* 媒体库工具栏与网格 */
@@ -201,7 +174,6 @@
 
   .page-title {
     font-size: 20px;
-    line-height: 28px;
   }
 
   /* 任务统计卡片 */
@@ -211,13 +183,12 @@
   }
 
   .task-stat .semi-card-body {
-    padding: 10px 12px;
+    padding: 12px 14px;
   }
 
   .task-stat-value {
     margin-top: 4px;
-    font-size: 24px;
-    line-height: 28px;
+    font-size: 23px;
   }
 
   .task-failure-label {
@@ -240,10 +211,6 @@
 
   .mobile-job-card > div:first-child {
     padding: 14px;
-  }
-
-  .mobile-job-card .semi-button {
-    min-height: 40px;
   }
 
   .toolbar-status {
@@ -294,43 +261,6 @@
     padding-block: 20px;
   }
 
-  .settings-action-label {
-    display: none;
-  }
-
-  /* 触控目标放大 */
-  .app-shell
-    :where(.page-heading, .page-toolbar, .app-header, .gallery-card-actions)
-    .semi-button {
-    min-height: 40px;
-  }
-
-  .app-header .semi-button-with-icon-only {
-    width: 40px;
-  }
-
-  :is(.app-shell, .semi-modal, .semi-sidesheet, .auth-page) .semi-input-wrapper-default,
-  :is(.app-shell, .semi-modal, .semi-sidesheet, .auth-page) .semi-select-single {
-    height: 40px;
-  }
-
-  /* 16px 避免 iOS 聚焦输入框时自动放大页面 */
-  :is(.app-shell, .semi-modal, .semi-sidesheet, .auth-page)
-    .semi-input-wrapper-default
-    .semi-input,
-  :is(.app-shell, .semi-modal, .semi-sidesheet, .auth-page) .semi-input-textarea {
-    font-size: 16px;
-  }
-
-  .auth-page .semi-button {
-    min-height: 44px;
-  }
-
-  .storage-filename-part .semi-button {
-    width: 32px;
-    height: 32px;
-  }
-
   .gallery-download {
     width: 40px;
     height: 40px;
@@ -348,20 +278,6 @@
 /* ---------------- ≤639.98px：手机 ---------------- */
 
 @media (max-width: 639.98px) {
-  /* Cookie 备份行收成两列 */
-  .cookie-backup-row {
-    grid-template-columns: minmax(0, 1fr) 32px;
-  }
-
-  .cookie-backup-row > .cookie-token-field {
-    grid-column: 1;
-  }
-
-  .cookie-backup-row > div:last-child {
-    grid-column: 2;
-    grid-row: 2;
-  }
-
   /* 媒体库筛选 */
   .gallery-toolbar .toolbar-search {
     flex-basis: 100%;
@@ -394,10 +310,6 @@
 
   .settings-page .settings-form {
     gap: 0;
-  }
-
-  .storage-rule-fields {
-    grid-template-columns: minmax(0, 1fr);
   }
 
   .archive-filters .archive-date {

@@ -3,26 +3,24 @@ import {
   Download,
   RefreshCw,
   Save,
-  ShieldCheck,
 } from "lucide-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import React, { useEffect, useRef, useState } from "react";
 import {
-  checkAuth,
   configQueryRoot,
   updateConfig,
   type AppConfig,
-  type AuthCheck,
 } from "../../lib/api";
-import { getErrorMessage, notifyError } from "../common/CommonUI";
+import { notifyError } from "../common/CommonUI";
 import { Button } from "@douyinfe/semi-ui";
-import { Popconfirm, Tooltip } from "../semi";
+import { Popconfirm, Tag, Tooltip } from "../semi";
 import { toast } from "../semi";
-import { CookieSettingsFields } from "./CookieSettings";
+import { XAccountsSettings } from "./XAccountsSettings";
 import { readEnvOverridden } from "./EnvOverrideNote";
 import { DownloadSettingsFields } from "./DownloadSettings";
 import { StorageManagement } from "./StorageManagement";
 import { LanguageSettings } from "./LanguageSettings";
+import { AccountSecurity } from "./AccountSecurity";
 
 export function ConfigForm({
   config,
@@ -41,17 +39,9 @@ export function ConfigForm({
   // GET/PUT 响应可能带 envOverridden: string[]（camelCase 字段名），
   // 用于在对应输入框下标注"由环境变量提供"。字段缺失时按空数组处理。
   const envOverridden = readEnvOverridden(config);
-  const [authResult, setAuthResult] = useState<AuthCheck | null>(null);
-  const [authError, setAuthError] = useState("");
-  const [authChecking, setAuthChecking] = useState(false);
   const [pendingSavedConfigKey, setPendingSavedConfigKey] = useState("");
   const pendingSavedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const draftRevision = useRef(0);
-  const autoCheckedCookieKey = useRef("");
-  const authCheckSequence = useRef(0);
-  const currentCookieKey = cookieCheckKey(draft);
-  const currentCookieKeyRef = useRef(currentCookieKey);
-  currentCookieKeyRef.current = currentCookieKey;
 
   useEffect(() => {
     const normalized = normalizeConfig(config);
@@ -78,6 +68,15 @@ export function ConfigForm({
     if (pendingSavedTimer.current) clearTimeout(pendingSavedTimer.current);
   }, []);
 
+  useEffect(() => {
+    if (!draftDirty) return;
+    const protectDraft = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
+    const protectNavigation = (event: Event) => event.preventDefault();
+    window.addEventListener("beforeunload", protectDraft);
+    window.addEventListener("settings:before-navigate", protectNavigation);
+    return () => { window.removeEventListener("beforeunload", protectDraft); window.removeEventListener("settings:before-navigate", protectNavigation); };
+  }, [draftDirty]);
+
   function updateDraft(action: React.SetStateAction<AppConfig>) {
     draftRevision.current += 1;
     setPendingSavedConfigKey("");
@@ -87,14 +86,6 @@ export function ConfigForm({
     }
     setDraftDirty(true);
     setDraft(action);
-  }
-
-  function updateAuthDraft(action: React.SetStateAction<AppConfig>) {
-    authCheckSequence.current += 1;
-    setAuthResult(null);
-    setAuthError("");
-    setAuthChecking(false);
-    updateDraft(action);
   }
 
   const mutation = useMutation({
@@ -124,62 +115,6 @@ export function ConfigForm({
     onError: notifyError(t("保存失败")),
   });
 
-  async function runAuthCheck(submitted: AppConfig, notify: boolean) {
-    const sequence = authCheckSequence.current + 1;
-    const cookieKey = cookieCheckKey(submitted);
-    authCheckSequence.current = sequence;
-    setAuthChecking(true);
-    setAuthError("");
-    try {
-      const result = await checkAuth(submitted);
-      if (sequence !== authCheckSequence.current || cookieKey !== currentCookieKeyRef.current) {
-        return;
-      }
-      setAuthResult(result);
-      if (!notify) {
-        return;
-      }
-      if (result.ok) {
-        toast.success({
-          message: t("Cookie 检测通过"),
-          description: result.screenName ? `@${result.screenName}` : result.message,
-        });
-        return;
-      }
-      toast.warning({
-        message: t("Cookie 检测未通过"),
-        description: result.message,
-      });
-    } catch (error) {
-      if (sequence !== authCheckSequence.current || cookieKey !== currentCookieKeyRef.current) {
-        return;
-      }
-      const message = getErrorMessage(error);
-      setAuthResult(null);
-      setAuthError(message);
-      if (notify) {
-        toast.error({
-          message: t("Cookie 检测失败"),
-          description: message,
-        });
-      }
-    } finally {
-      if (sequence === authCheckSequence.current) {
-        setAuthChecking(false);
-      }
-    }
-  }
-
-  useEffect(() => {
-    const normalized = normalizeConfig(config);
-    const cookieKey = cookieCheckKey(normalized);
-    if (autoCheckedCookieKey.current === cookieKey) {
-      return;
-    }
-    autoCheckedCookieKey.current = cookieKey;
-    void runAuthCheck(normalized, false);
-  }, [config]);
-
   // 重新加载：丢弃草稿并拉取服务器最新配置。
   // dirty 时由 Popconfirm 二次确认（见下方按钮），避免误点丢掉未保存的修改。
   function reloadConfig() {
@@ -207,13 +142,12 @@ export function ConfigForm({
   );
 
   return (
-    <div className="workspace-page settings-form">
+    <div className="workspace-page settings-form settings-flat">
       <div className="page-heading">
-        <h1 className="page-title">{t("设置")}</h1>
-
+        <h1 className="page-title">{t("系统配置")}</h1>
         <div className="page-actions">
+          {draftDirty && <Tag tone="warning">{t("未保存")}</Tag>}
           {draftDirty ? (
-            // 有未保存修改：二次确认后再丢弃
             <Popconfirm
               title={t("放弃未保存的修改？")}
               description={t("将重新加载服务器上的最新配置，当前编辑内容会丢失。")}
@@ -237,17 +171,6 @@ export function ConfigForm({
             </Tooltip>
           )}
           <Button
-            type="tertiary"
-            icon={<ShieldCheck className="size-4" />}
-            loading={authChecking}
-            disabled={authChecking}
-            aria-busy={authChecking}
-            aria-label={t("检测 Cookie")}
-            title={t("检测 Cookie")}
-            onClick={() => void runAuthCheck(draft, true)}
-          >
-            <span className="settings-action-label">{t("检测 Cookie")}</span></Button>
-          <Button
             theme="solid"
             icon={<Save className="size-4" />}
             loading={mutation.isPending}
@@ -255,36 +178,23 @@ export function ConfigForm({
             aria-busy={mutation.isPending}
             onClick={() => mutation.mutate(configDiff(draftBase.current, draft))}
           >
-            {t("保存配置")}</Button>
+            {t("保存")}</Button>
         </div>
       </div>
 
+      <div className="settings-general-bar">
+        <LanguageSettings />
+        <AccountSecurity compact />
+      </div>
+
+      <section className="semi-settings-section settings-download">
+        <h2 className="settings-section-title"><Download size={16} />{t("下载与归档")}</h2>
+        <DownloadSettingsFields draft={draft} onChange={updateDraft} envOverridden={envOverridden} />
+      </section>
+
       <StorageManagement />
 
-      <div className="settings-secondary-grid">
-        <section className="semi-settings-section settings-download">
-          <h2 className="settings-section-title"><Download size={16} />{t("下载与归档")}</h2>
-          <DownloadSettingsFields
-            draft={draft}
-            onChange={updateDraft}
-            onAuthChange={updateAuthDraft}
-            envOverridden={envOverridden}
-          />
-        </section>
-
-        <section className="semi-settings-section settings-cookies">
-          <h2 className="settings-section-title"><ShieldCheck size={16} />{t("X / Twitter Cookie 凭证")}</h2>
-          <CookieSettingsFields
-            authError={authError}
-            authResult={authResult}
-            checking={authChecking}
-            draft={draft}
-            onChange={updateAuthDraft}
-            envOverridden={envOverridden}
-          />
-        </section>
-      </div>
-      <section className="semi-settings-section"><LanguageSettings /></section>
+      <XAccountsSettings />
     </div>
   );
 }
@@ -306,15 +216,6 @@ export function normalizeConfig(config: AppConfig): AppConfig {
 
 export function configSyncKey(config: AppConfig) {
   return JSON.stringify(config);
-}
-
-export function cookieCheckKey(config: AppConfig) {
-  return JSON.stringify([
-    config.authToken ?? "",
-    config.csrfToken ?? "",
-    config.additionalCookies ?? "",
-    config.proxyUrl ?? "",
-  ]);
 }
 
 /** 只返回 draft 相对于 base 有变化的字段（PATCH 语义），避免多标签页并发保存时

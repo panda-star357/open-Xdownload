@@ -793,11 +793,22 @@ func init() {
 		"media_context(media_key,payload,position,tweet_id);media_sync(count,cursor,error,last_seen_tweet_id,status,stop_id,updated_at,user_id);", 1)
 	schemaColumnsForVersion[9] = v9
 
-	// v10 在 v9 基础上：users 增加 avatar_url（归档库按用户浏览时显示头像）。
-	v10 := strings.Replace(v9,
+	// v10 在 v9 基础上新增 twscrape 风格账号池的三张表。
+	v10 := v9 + ";x_account_locks(account_id,queue,reason,until);" +
+		"x_account_stats(account_id,day,queue,requests);" +
+		"x_accounts(active,auth_token,created_at,ct0,error_msg,extra_cookies,id,is_primary,last_used,proxy,screen_name,source,updated_at,user_agent,verified_at)"
+	schemaColumnsForVersion[10] = v10
+
+	// v11 在 v10 基础上给 jobs 增加 batch_size（定时全文归档每轮用户上限）。
+	v11 := strings.Replace(v10,
+		"jobs(archive_mode,available_at,available_ns,backfill,created_at,",
+		"jobs(archive_mode,available_at,available_ns,backfill,batch_size,created_at,", 1)
+	schemaColumnsForVersion[11] = v11
+	// v12 在 v11 基础上给 users 增加 avatar_url（归档库按用户浏览时显示头像）。
+	v12 := strings.Replace(v11,
 		"users(friends_count,id,media_count,name,protected,screen_name,updated_at)",
 		"users(avatar_url,friends_count,id,media_count,name,protected,screen_name,updated_at)", 1)
-	schemaColumnsForVersion[10] = v10
+	schemaColumnsForVersion[12] = v12
 }
 
 func TestSchemaVersionMatchesTableColumns(t *testing.T) {

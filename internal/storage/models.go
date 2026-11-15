@@ -81,6 +81,8 @@ type Job struct {
 	DeferredSeconds int64       `json:"-" db:"deferred_seconds"`
 	ArchiveMode     ArchiveMode `json:"archiveMode" db:"archive_mode"`
 	Backfill        bool        `json:"backfill" db:"backfill"`
+	// BatchSize 是全文归档每轮最多处理的用户数；0 表示不限制。
+	BatchSize int `json:"batchSize,omitempty" db:"batch_size"`
 }
 
 type JobDraft struct {
@@ -89,6 +91,8 @@ type JobDraft struct {
 	Title       string
 	ArchiveMode ArchiveMode
 	Backfill    bool
+	// BatchSize 是全文归档每轮最多处理的用户数；0 表示不限制。
+	BatchSize int
 	// Source 为空时按 manual 处理；定时计划由调度器显式设为 schedule。
 	Source JobSource
 }
@@ -99,6 +103,7 @@ type ArchiveScheduleItem struct {
 	Title       string      `json:"title"`
 	ArchiveMode ArchiveMode `json:"archiveMode,omitempty"`
 	Backfill    bool        `json:"backfill,omitempty"`
+	BatchSize   int         `json:"batchSize,omitempty"`
 }
 
 type ArchiveSchedule struct {
@@ -111,6 +116,8 @@ type ArchiveSchedule struct {
 	LastRunAt       *time.Time            `json:"lastRunAt,omitempty" db:"last_run_at"`
 	NextRunAt       time.Time             `json:"nextRunAt" db:"next_run_at"`
 	LastJobIDs      []int64               `json:"lastJobIds" db:"-"`
+	LastRunStatus   string                `json:"lastRunStatus,omitempty" db:"-"`
+	LastRunMessage  string                `json:"lastRunMessage,omitempty" db:"-"`
 	LastJobIDsJSON  string                `json:"-" db:"last_job_ids"`
 	CreatedAt       time.Time             `json:"createdAt" db:"created_at"`
 	UpdatedAt       time.Time             `json:"updatedAt" db:"updated_at"`
@@ -161,6 +168,30 @@ type JobStats struct {
 	Active    int `json:"active" db:"active"`
 	Completed int `json:"completed" db:"completed"`
 	Failed    int `json:"failed" db:"failed"`
+}
+
+// JobListFilter 是任务中心的服务端筛选条件。Status 为空表示不限制状态。
+type JobListFilter struct {
+	Status  string
+	Kind    JobKind
+	Keyword string
+}
+
+// JobListCounts 是在 Kind/Keyword 条件下、忽略 Status 的全量分组计数。
+// 这样前端切换状态标签时不需要只依赖当前页的数量。
+type JobListCounts struct {
+	All       int `json:"all"`
+	Active    int `json:"active"`
+	Completed int `json:"completed"`
+	Failed    int `json:"failed"`
+}
+
+type JobListPage struct {
+	Items    []Job         `json:"items"`
+	Page     int           `json:"page"`
+	PageSize int           `json:"pageSize"`
+	Total    int           `json:"total"`
+	Counts   JobListCounts `json:"counts"`
 }
 
 // DashboardMetaView is the compact stats payload piggybacked on SSE and
