@@ -334,7 +334,7 @@ export function GalleryPage({ filter: controlledFilter, onFilterChange }: Galler
   useTranslation();
   const [localFilter, setLocalFilter] = useState<GalleryRouteState>(defaultGalleryFilter);
   // 归档库的两种浏览方式：媒体网格 / 按账号卡片。
-  const [viewMode, setViewMode] = useState<"media" | "users">("media");
+  const [viewMode, setViewMode] = useState<"media" | "users">("users");
   const filter = controlledFilter ?? localFilter;
   const updateFilter = useCallback(
     (patch: Partial<GalleryRouteState>, options?: { replace?: boolean }) => {
@@ -403,7 +403,8 @@ export function GalleryPage({ filter: controlledFilter, onFilterChange }: Galler
       ),
     // 翻页/切筛选时保留上一页内容，避免整块骨架闪烁与分页条消失。
     placeholderData: keepPreviousData,
-    enabled: !rangeError,
+    // 默认「按账号」视图下不请求媒体列表，切到「媒体」时才加载。
+    enabled: viewMode === "media" && !rangeError,
     staleTime: 10 * 60_000,
     gcTime: 30 * 60_000,
     refetchOnWindowFocus: false,
@@ -581,8 +582,8 @@ export function GalleryPage({ filter: controlledFilter, onFilterChange }: Galler
             value={viewMode}
             onChange={(event) => setViewMode(String(event.target.value) as "media" | "users")}
             options={[
-              { label: t("媒体"), value: "media" },
               { label: t("按账号"), value: "users" },
+              { label: t("媒体"), value: "media" },
             ]}
           />
           {viewMode === "media" && (
@@ -593,6 +594,7 @@ export function GalleryPage({ filter: controlledFilter, onFilterChange }: Galler
           )}
         </div>
       </div>
+      {viewMode === "media" && (<>
       <div className="page-toolbar gallery-toolbar">
         <div className="toolbar-status" role="radiogroup" aria-label={t("类型")}>
           <RadioGroup
@@ -708,6 +710,8 @@ export function GalleryPage({ filter: controlledFilter, onFilterChange }: Galler
       {libraryQuery.data?.truncated && (
         <Alert type="warning" message={t("媒体库索引已达上限，当前仅显示最近的记录")} />
       )}
+
+      </>)}
 
       {/* 按账号浏览：头像 + 名字的卡片网格，点卡片回到该账号的媒体列表 */}
       {viewMode === "users" ? (
